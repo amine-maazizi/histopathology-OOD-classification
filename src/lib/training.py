@@ -18,10 +18,12 @@ def binary_accuracy(pred, target):
     return (pred == target).float().mean()
 
 
-def train_epoch(train_dataloader, linear_probing, criterion, optimizer, device):
+def train_epoch(train_dataloader, linear_probing, criterion, optimizer, device, frozen=None):
     """Run one training epoch and return per-sample losses and accuracies."""
 
     linear_probing.train()
+    if frozen is not None:
+        frozen.eval()
     train_metrics, train_losses = [], []
 
     for train_x, train_y in tqdm(train_dataloader, leave=False):
@@ -65,6 +67,7 @@ def fit(
     num_epochs=100,
     patience=10,
     checkpoint_path="best_model.pth",
+    frozen=None,
 ):
     """Train with early stopping and save the best weights to disk."""
 
@@ -73,7 +76,7 @@ def fit(
     history = []
 
     for epoch in range(num_epochs):
-        train_metrics, train_losses = train_epoch(train_dataloader, linear_probing, criterion, optimizer, device)
+        train_metrics, train_losses = train_epoch(train_dataloader, linear_probing, criterion, optimizer, device, frozen=frozen)
         print(
             f"Epoch train [{epoch + 1}/{num_epochs}] | Loss {sum(train_losses) / len(train_losses):.4f} | Metric {sum(train_metrics) / len(train_metrics):.4f}"
         )
