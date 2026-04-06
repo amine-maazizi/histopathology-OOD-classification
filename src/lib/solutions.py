@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from .datasets import BaselineDataset, PrecomputedDataset, precompute
 from .inference import load_test_ids, predict_test, write_submission
-from .models import build_linear_probing_head, load_dinov2_backbone
+from .models import build_linear_probing_head, build_lora_dinov2, load_dinov2_backbone
 from .training import fit
 
 
@@ -108,6 +108,66 @@ class BaselineSolution(BaseSolution):
                 self.linear_probing.load_state_dict(torch.load("best_model.pth", weights_only=True))
             except TypeError:
                 self.linear_probing.load_state_dict(torch.load("best_model.pth"))
+
+        test_ids = load_test_ids(self.config["test_path"])
+        predictions = predict_test(
+            test_ids,
+            self.preprocessing,
+            self.feature_extractor,
+            self.linear_probing,
+            self.device,
+            test_images_path=self.config["test_path"],
+        )
+        return write_submission(test_ids, predictions, output_csv)
+
+
+@register_solution("lora_dinov2")
+class LoRASolution(BaseSolution):
+    """Fine-tunes DINOv2 LoRA adapters with a linear classification head."""
+
+    def _build_dataloaders(self):
+        train_dataset = BaselineDataset(self.config["train_path"], self.preprocessing, "train")
+        val_dataset = BaselineDataset(self.config["val_path"], self.preprocessing, "train")
+        
+        train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=self.config["batch_size"])
+        val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=self.config["batch_size"])
+        return train_dataloader, val_dataloader
+
+    def _build_model(self):
+        self.feature_extractor = build_lora_dinov2(rank=self.config["lora_rank"], alpha=self.config["lora_alpha"]).to(self.device)
+        self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
+
+    def fit(self):
+        train_dataloader, val_dataloader = self._build_dataloaders()
+        self._build_model()
+
+        full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
+        trainable_params = [p for p in full_model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable_params, lr=self.config["lr"])
+        criterion = torch.nn.BCELoss()
+        self.history = fit(
+            train_dataloader,
+            val_dataloader,
+            full_model,
+            optimizer,
+            criterion,
+            self.device,
+            num_epochs=self.config["num_epochs"],
+            patience=self.config["patience"],
+            checkpoint_path="best_model_lora_dinov2.pth",
+        )
+        return self
+    
+    def predict_test(self, output_csv="lora_dinov2.csv"):
+        if self.feature_extractor is None or self.linear_probing is None:
+            self._build_model()
+            full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
+            try:
+                full_model.load_state_dict(torch.load("best_model_lora_dinov2.pth", weights_only=True))
+            except TypeError:
+                full_model.load_state_dict(torch.load("best_model_lora_dinov2.pth"))
+            self.feature_extractor.eval()
+            self.linear_probing.eval()
 
         test_ids = load_test_ids(self.config["test_path"])
         predictions = predict_test(
