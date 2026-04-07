@@ -30,20 +30,27 @@ class LoRALinear(nn.Module):
         self.rank = rank
         self.scale = alpha / rank
 
-        self.lora_A = nn.Parameter(torch.randn(linear.in_features, rank) * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(rank, linear.out_features))
+        for param in self.linear.parameters():
+            param.requires_grad_(False)
+
+        self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features))
+        self.lora_B = nn.Parameter(torch.zeros(linear.out_features, rank))
+
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+        nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        base = self.linear(x)
-        lora = F.linear(F.linear(x, self.lora_A), self.lora_B)
-        return base + self.scale * lora
+        return self.linear(x) + self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
 
 def build_lora_dinov2(rank=8, alpha=1.0):
-    """Load the DINOv2 backbone and inject LoRA adapters into each attention block's qkv projection."""
+    """Load the DINOv2 backbone and inject LoRA adapters into each attention block's qkv and projection layers."""
 
     backbone = load_dinov2_backbone()
     for param in backbone.parameters():
         param.requires_grad_(False)
+
     for block in backbone.blocks:
         block.attn.qkv = LoRALinear(block.attn.qkv, rank=rank, alpha=alpha)
+        block.attn.proj = LoRALinear(block.attn.proj, rank=rank, alpha=alpha)
+        
     return backbone

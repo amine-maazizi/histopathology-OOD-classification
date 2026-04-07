@@ -12,7 +12,7 @@ from .augmentations import StainColorJitter
 from .datasets import BaselineDataset, PrecomputedDataset, precompute
 from .inference import load_test_ids, predict_test, write_submission
 from .models import build_linear_probing_head, build_lora_dinov2, load_dinov2_backbone
-from .training import fit, fit_frozen_backbone
+from .training import fit, fit_trainable_backbone, fit_frozen_backbone
 
 
 SOLUTION_REGISTRY = {}
@@ -426,32 +426,31 @@ class LoRASolution(BaseSolution):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
 
-        full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
-        trainable_params = [p for p in full_model.parameters() if p.requires_grad]
+        trainable_params = [p for p in self.feature_extractor.parameters() if p.requires_grad]
+        trainable_params += list(self.linear_probing.parameters())
         optimizer = torch.optim.Adam(trainable_params, lr=self.config["lr"])
         criterion = torch.nn.BCELoss()
-        self.history = fit(
+        self.history = fit_trainable_backbone(
             train_dataloader,
             val_dataloader,
-            full_model,
+            self.feature_extractor,
+            self.linear_probing,
             optimizer,
             criterion,
             self.device,
             num_epochs=self.config["num_epochs"],
             patience=self.config["patience"],
-            checkpoint_path="best_model_lora_dinov2.pth",
-            frozen=self.feature_extractor,
+            checkpoint_path=self.config.get("checkpoint_path", "best_model_lora_dinov2.pth"),
         )
         return self
-    
+
     def predict_test(self, output_csv="lora_dinov2.csv"):
         if self.feature_extractor is None or self.linear_probing is None:
             self._build_model()
-            full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
-            try:
-                full_model.load_state_dict(torch.load("best_model_lora_dinov2.pth", weights_only=True))
-            except TypeError:
-                full_model.load_state_dict(torch.load("best_model_lora_dinov2.pth"))
+            checkpoint_path = self.config.get("checkpoint_path", "best_model_lora_dinov2.pth")
+            ckpt = torch.load(checkpoint_path, weights_only=True)
+            self.feature_extractor.load_state_dict(ckpt["lora"], strict=False)
+            self.linear_probing.load_state_dict(ckpt["head"])
             self.feature_extractor.eval()
             self.linear_probing.eval()
 
@@ -512,33 +511,31 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
 
-        full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
-        trainable_params = [p for p in full_model.parameters() if p.requires_grad]
+        trainable_params = [p for p in self.feature_extractor.parameters() if p.requires_grad]
+        trainable_params += list(self.linear_probing.parameters())
         optimizer = torch.optim.Adam(trainable_params, lr=self.config["lr"])
         criterion = torch.nn.BCELoss()
-        self.history = fit(
+        self.history = fit_trainable_backbone(
             train_dataloader,
             val_dataloader,
-            full_model,
+            self.feature_extractor,
+            self.linear_probing,
             optimizer,
             criterion,
             self.device,
             num_epochs=self.config["num_epochs"],
             patience=self.config["patience"],
             checkpoint_path=self.config.get("checkpoint_path", "best_model_lora_dinov2_targeted_augmentations.pth"),
-            frozen=self.feature_extractor,
         )
         return self
 
     def predict_test(self, output_csv="lora_dinov2_targeted_augmentations.csv"):
         if self.feature_extractor is None or self.linear_probing is None:
             self._build_model()
-            full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
             checkpoint_path = self.config.get("checkpoint_path", "best_model_lora_dinov2_targeted_augmentations.pth")
-            try:
-                full_model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-            except TypeError:
-                full_model.load_state_dict(torch.load(checkpoint_path))
+            ckpt = torch.load(checkpoint_path, weights_only=True)
+            self.feature_extractor.load_state_dict(ckpt["lora"], strict=False)
+            self.linear_probing.load_state_dict(ckpt["head"])
             self.feature_extractor.eval()
             self.linear_probing.eval()
 
