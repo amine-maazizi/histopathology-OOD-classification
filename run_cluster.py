@@ -40,7 +40,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--head_lr", type=float, default=1e-3)
+    parser.add_argument("--backbone_lr", type=float, default=4e-4)
     parser.add_argument("--num-workers", type=int, default=4)
 
     parser.add_argument("--stain-sigma", type=float, default=0.1)
@@ -91,7 +92,8 @@ def main() -> None:
         "resize": (224, 224),
         "num_epochs": args.num_epochs,
         "patience": args.patience,
-        "lr": args.lr,
+        "head_lr": args.head_lr,
+        "backbone_lr": args.backbone_lr,
         "checkpoint_path": args.checkpoint_path,
         "stain_sigma": args.stain_sigma,
         "jitter_brightness": args.jitter_brightness,

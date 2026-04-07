@@ -41,7 +41,8 @@ class BaseSolution:
             "resize": (98, 98),
             "num_epochs": 100,
             "patience": 10,
-            "lr": 0.001,
+            "head_lr": 0.001,
+            "backbone_lr": 4e-4,
             "checkpoint_path": "best_model.pth",
             "jitter_brightness": 0.15,
             "jitter_contrast": 0.15,
@@ -97,7 +98,7 @@ class BaselineSolution(BaseSolution):
         train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=self.config["batch_size"])
         val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=self.config["batch_size"])
 
-        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["lr"])
+        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["head_lr"])
         criterion = torch.nn.BCELoss()
         self.history = fit(
             train_dataloader,
@@ -168,7 +169,7 @@ class Baseline224Solution(BaseSolution):
         train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=self.config["batch_size"])
         val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=self.config["batch_size"])
 
-        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["lr"])
+        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["head_lr"])
         criterion = torch.nn.BCELoss()
 
         self.history = fit(
@@ -260,7 +261,7 @@ class BaselineColorJitterSolution(BaseSolution):
     def fit(self):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
-        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["lr"])
+        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["head_lr"])
         criterion = torch.nn.BCELoss()
         self.history = fit_frozen_backbone(
             train_dataloader,
@@ -362,7 +363,7 @@ class Baseline224TargetedAugmentationsSolution(BaseSolution):
     def fit(self):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
-        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["lr"])
+        optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["head_lr"])
         criterion = torch.nn.BCELoss()
         self.history = fit_frozen_backbone(
             train_dataloader,
@@ -426,9 +427,10 @@ class LoRASolution(BaseSolution):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
 
-        trainable_params = [p for p in self.feature_extractor.parameters() if p.requires_grad]
-        trainable_params += list(self.linear_probing.parameters())
-        optimizer = torch.optim.Adam(trainable_params, lr=self.config["lr"])
+        optimizer = torch.optim.Adam([
+            {"params": [p for p in self.feature_extractor.parameters() if p.requires_grad], "lr": self.config["backbone_lr"]},
+            {"params": self.linear_probing.parameters(), "lr": self.config["head_lr"]},
+        ])
         criterion = torch.nn.BCELoss()
         self.history = fit_trainable_backbone(
             train_dataloader,
@@ -511,9 +513,10 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
 
-        trainable_params = [p for p in self.feature_extractor.parameters() if p.requires_grad]
-        trainable_params += list(self.linear_probing.parameters())
-        optimizer = torch.optim.Adam(trainable_params, lr=self.config["lr"])
+        optimizer = torch.optim.Adam([
+            {"params": [p for p in self.feature_extractor.parameters() if p.requires_grad], "lr": self.config["backbone_lr"]},
+            {"params": self.linear_probing.parameters(), "lr": self.config["head_lr"]},
+        ])
         criterion = torch.nn.BCELoss()
         self.history = fit_trainable_backbone(
             train_dataloader,
