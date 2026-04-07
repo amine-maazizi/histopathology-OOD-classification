@@ -12,7 +12,7 @@ from .augmentations import StainColorJitter
 from .datasets import BaselineDataset, PrecomputedDataset, precompute
 from .inference import load_test_ids, predict_test, write_submission
 from .models import build_linear_probing_head, build_lora_dinov2, load_dinov2_backbone
-from .training import fit
+from .training import fit, fit_frozen_backbone
 
 
 SOLUTION_REGISTRY = {}
@@ -83,6 +83,8 @@ class BaselineSolution(BaseSolution):
     def _build_model(self):
         self.feature_extractor = load_dinov2_backbone().to(self.device)
         self.feature_extractor.eval()
+        for p in self.feature_extractor.parameters():
+            p.requires_grad_(False)
         self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
 
     def fit(self):
@@ -152,6 +154,8 @@ class Baseline224Solution(BaseSolution):
     def _build_model(self):
         self.feature_extractor = load_dinov2_backbone().to(self.device)
         self.feature_extractor.eval()
+        for p in self.feature_extractor.parameters():
+            p.requires_grad_(False)
         self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
 
     def fit(self):
@@ -228,33 +232,47 @@ class BaselineColorJitterSolution(BaseSolution):
         train_dataset = BaselineDataset(self.config["train_path"], self.train_preprocessing, "train")
         val_dataset = BaselineDataset(self.config["val_path"], self.eval_preprocessing, "train")
 
-        train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=self.config["batch_size"])
-        val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=self.config["batch_size"])
+        num_workers = self.config.get("num_workers", 4)
+        pin_memory = self.device.type == "cuda"
+        train_dataloader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            batch_size=self.config["batch_size"],
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            shuffle=False,
+            batch_size=self.config["batch_size"],
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         return train_dataloader, val_dataloader
 
     def _build_model(self):
         self.feature_extractor = load_dinov2_backbone().to(self.device)
         self.feature_extractor.eval()
+        for p in self.feature_extractor.parameters():
+            p.requires_grad_(False)
         self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
 
     def fit(self):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
-
-        full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
         optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["lr"])
         criterion = torch.nn.BCELoss()
-        self.history = fit(
+        self.history = fit_frozen_backbone(
             train_dataloader,
             val_dataloader,
-            full_model,
+            self.feature_extractor,
+            self.linear_probing,
             optimizer,
             criterion,
             self.device,
             num_epochs=self.config["num_epochs"],
             patience=self.config["patience"],
             checkpoint_path=self.config.get("checkpoint_path", "best_model_color_jitter.pth"),
-            frozen=self.feature_extractor,
         )
         return self
 
@@ -262,11 +280,15 @@ class BaselineColorJitterSolution(BaseSolution):
         if self.feature_extractor is None or self.linear_probing is None:
             self._build_model()
             checkpoint_path = self.config.get("checkpoint_path", "best_model_color_jitter.pth")
-            full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
             try:
-                full_model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-            except TypeError:
-                full_model.load_state_dict(torch.load(checkpoint_path))
+                self.linear_probing.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+            except (TypeError, RuntimeError):
+                state_dict = torch.load(checkpoint_path)
+                try:
+                    self.linear_probing.load_state_dict(state_dict)
+                except RuntimeError:
+                    full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
+                    full_model.load_state_dict(state_dict)
             self.feature_extractor.eval()
             self.linear_probing.eval()
 
@@ -312,33 +334,47 @@ class Baseline224TargetedAugmentationsSolution(BaseSolution):
         train_dataset = BaselineDataset(self.config["train_path"], self.train_preprocessing, "train")
         val_dataset = BaselineDataset(self.config["val_path"], self.eval_preprocessing, "train")
 
-        train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=self.config["batch_size"])
-        val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=self.config["batch_size"])
+        num_workers = self.config.get("num_workers", 4)
+        pin_memory = self.device.type == "cuda"
+        train_dataloader = DataLoader(
+            train_dataset,
+            shuffle=True,
+            batch_size=self.config["batch_size"],
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            shuffle=False,
+            batch_size=self.config["batch_size"],
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
         return train_dataloader, val_dataloader
 
     def _build_model(self):
         self.feature_extractor = load_dinov2_backbone().to(self.device)
         self.feature_extractor.eval()
+        for p in self.feature_extractor.parameters():
+            p.requires_grad_(False)
         self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
 
     def fit(self):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
-
-        full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
         optimizer = torch.optim.Adam(self.linear_probing.parameters(), lr=self.config["lr"])
         criterion = torch.nn.BCELoss()
-        self.history = fit(
+        self.history = fit_frozen_backbone(
             train_dataloader,
             val_dataloader,
-            full_model,
+            self.feature_extractor,
+            self.linear_probing,
             optimizer,
             criterion,
             self.device,
             num_epochs=self.config["num_epochs"],
             patience=self.config["patience"],
             checkpoint_path=self.config.get("checkpoint_path", "best_model_224_targeted_augmentations.pth"),
-            frozen=self.feature_extractor,
         )
         return self
 
@@ -346,11 +382,15 @@ class Baseline224TargetedAugmentationsSolution(BaseSolution):
         if self.feature_extractor is None or self.linear_probing is None:
             self._build_model()
             checkpoint_path = self.config.get("checkpoint_path", "best_model_224_targeted_augmentations.pth")
-            full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
             try:
-                full_model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
-            except TypeError:
-                full_model.load_state_dict(torch.load(checkpoint_path))
+                self.linear_probing.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+            except (TypeError, RuntimeError):
+                state_dict = torch.load(checkpoint_path)
+                try:
+                    self.linear_probing.load_state_dict(state_dict)
+                except RuntimeError:
+                    full_model = torch.nn.Sequential(self.feature_extractor, self.linear_probing)
+                    full_model.load_state_dict(state_dict)
             self.feature_extractor.eval()
             self.linear_probing.eval()
 
