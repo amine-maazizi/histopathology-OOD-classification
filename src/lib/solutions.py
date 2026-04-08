@@ -9,10 +9,10 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
 from .augmentations import StainColorJitter
-from .datasets import BaselineDataset, PrecomputedDataset, precompute
+from .datasets import BaselineDataset, CenterBalancedBatchSampler, PrecomputedDataset, precompute
 from .inference import load_test_ids, predict_test, write_submission
 from .models import build_linear_probing_head, build_lora_dinov2, load_dinov2_backbone
-from .training import fit, fit_trainable_backbone, fit_frozen_backbone
+from .training import fit, fit_frozen_backbone, fit_trainable_backbone, fit_trainable_backbone_with_class_conditional_coral
 
 
 SOLUTION_REGISTRY = {}
@@ -51,6 +51,9 @@ class BaseSolution:
             "stain_sigma": 0.1, 
             "lora_rank": 8,
             "lora_alpha": 1.0,
+            "coral_lambda": 0.05,
+            "coral_eps": 1e-5,
+            "num_workers": 4,
             "device": "cuda" if torch.cuda.is_available() else "cpu",
         }
         if config is not None:
@@ -509,6 +512,21 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
         ).to(self.device)
         self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
 
+        head_init_checkpoint = self.config.get("head_init_checkpoint")
+        if head_init_checkpoint:
+            try:
+                state_dict = torch.load(head_init_checkpoint, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(head_init_checkpoint)
+
+            try:
+                self.linear_probing.load_state_dict(state_dict)
+            except Exception as error:
+                raise RuntimeError(
+                    "Failed to initialize linear head from "
+                    f"'{head_init_checkpoint}'. Expected a plain linear probe state_dict with matching shapes."
+                ) from error
+
     def fit(self):
         train_dataloader, val_dataloader = self._build_dataloaders()
         self._build_model()
@@ -546,6 +564,87 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
         predictions = predict_test(
             test_ids,
             self.eval_preprocessing,
+            self.feature_extractor,
+            self.linear_probing,
+            self.device,
+            test_images_path=self.config["test_path"],
+        )
+        return write_submission(test_ids, predictions, output_csv)
+
+
+@register_solution("lora_dinov2_class_conditional_coral")
+class LoRAClassConditionalCoralSolution(BaseSolution):
+    """LoRA fine-tuning with class-conditional CORAL across training centers."""
+
+    def _build_dataloaders(self):
+        train_dataset = BaselineDataset(self.config["train_path"], self.preprocessing, "train", return_center=True)
+        val_dataset = BaselineDataset(self.config["val_path"], self.preprocessing, "train")
+
+        sampler = CenterBalancedBatchSampler(train_dataset.centers, self.config["batch_size"])
+        num_workers = self.config.get("num_workers", 4)
+        pin_memory = self.device.type == "cuda"
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            shuffle=False,
+            batch_size=self.config["batch_size"],
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+        return train_dataloader, val_dataloader
+
+    def _build_model(self):
+        self.feature_extractor = build_lora_dinov2(
+            rank=self.config["lora_rank"],
+            alpha=self.config["lora_alpha"],
+        ).to(self.device)
+        self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
+
+    def fit(self):
+        train_dataloader, val_dataloader = self._build_dataloaders()
+        self._build_model()
+
+        optimizer = torch.optim.Adam([
+            {"params": [p for p in self.feature_extractor.parameters() if p.requires_grad], "lr": self.config["backbone_lr"]},
+            {"params": self.linear_probing.parameters(), "lr": self.config["head_lr"]},
+        ])
+        criterion = torch.nn.BCELoss()
+        self.history = fit_trainable_backbone_with_class_conditional_coral(
+            train_dataloader,
+            val_dataloader,
+            self.feature_extractor,
+            self.linear_probing,
+            optimizer,
+            criterion,
+            self.device,
+            coral_lambda=self.config.get("coral_lambda", 0.05),
+            coral_eps=self.config.get("coral_eps", 1e-5),
+            num_epochs=self.config["num_epochs"],
+            patience=self.config["patience"],
+            checkpoint_path=self.config.get("checkpoint_path", "best_model_lora_dinov2_class_conditional_coral.pth"),
+        )
+        return self
+
+    def predict_test(self, output_csv="lora_dinov2_class_conditional_coral.csv"):
+        if self.feature_extractor is None or self.linear_probing is None:
+            self._build_model()
+            checkpoint_path = self.config.get("checkpoint_path", "best_model_lora_dinov2_class_conditional_coral.pth")
+            ckpt = torch.load(checkpoint_path, weights_only=True)
+            self.feature_extractor.load_state_dict(ckpt["lora"], strict=False)
+            self.linear_probing.load_state_dict(ckpt["head"])
+            self.feature_extractor.eval()
+            self.linear_probing.eval()
+
+        test_ids = load_test_ids(self.config["test_path"])
+        predictions = predict_test(
+            test_ids,
+            self.preprocessing,
             self.feature_extractor,
             self.linear_probing,
             self.device,
