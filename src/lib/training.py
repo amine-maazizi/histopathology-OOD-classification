@@ -73,7 +73,7 @@ def fit(
 ):
     """Train with early stopping and save the best weights to disk."""
 
-    min_loss, best_epoch = float("inf"), 0
+    min_loss, min_val_acc, best_epoch = float("inf"), float("inf"), 0
     best_state_dict = copy.deepcopy(linear_probing.state_dict())
     history = []
 
@@ -99,9 +99,9 @@ def fit(
             }
         )
 
-        if mean_val_loss < min_loss:
-            print(f"New best loss {min_loss:.4f} -> {mean_val_loss:.4f}")
-            min_loss = mean_val_loss
+        if min_val_acc < sum(val_metrics) / len(val_metrics):
+            print(f"New best accuracy {min_val_acc:.4f} -> {sum(val_metrics) / len(val_metrics):.4f}")
+            min_val_acc = sum(val_metrics) / len(val_metrics)
             best_epoch = epoch
             best_state_dict = copy.deepcopy(linear_probing.state_dict())
             torch.save(linear_probing.state_dict(), checkpoint_path)
@@ -175,7 +175,7 @@ def fit_frozen_backbone(
 ):
     """Train a linear probe while keeping the backbone frozen and out of autograd."""
 
-    min_loss, best_epoch = float("inf"), 0
+    min_loss, best_epoch, max_val_acc = float("inf"), 0, -float("inf")
     best_state_dict = copy.deepcopy(linear_probing.state_dict())
     history = []
 
@@ -214,9 +214,9 @@ def fit_frozen_backbone(
             }
         )
 
-        if mean_val_loss < min_loss:
-            print(f"New best loss {min_loss:.4f} -> {mean_val_loss:.4f}")
-            min_loss = mean_val_loss
+        if max_val_acc < sum(val_metrics) / len(val_metrics):
+            print(f"New best accuracy {max_val_acc:.4f} -> {sum(val_metrics) / len(val_metrics):.4f}")
+            max_val_acc = sum(val_metrics) / len(val_metrics)
             best_epoch = epoch
             best_state_dict = copy.deepcopy(linear_probing.state_dict())
             torch.save(linear_probing.state_dict(), checkpoint_path)
@@ -284,6 +284,7 @@ def fit_trainable_backbone(
     num_epochs=100,
     patience=10,
     checkpoint_path="best_model.pth",
+    scheduler=None,
 ):
     """Fine-tune LoRA adapters and train linear probe."""
 
@@ -316,6 +317,10 @@ def fit_trainable_backbone(
         print(
             f"Epoch valid [{epoch + 1}/{num_epochs}] | Loss {mean_val_loss:.4f} | Metric {sum(val_metrics) / len(val_metrics):.4f}"
         )
+
+        if scheduler is not None:
+            scheduler.step()
+            print(f"LR: {scheduler.get_last_lr()}")
 
         history.append(
             {

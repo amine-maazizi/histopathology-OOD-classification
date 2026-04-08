@@ -8,9 +8,12 @@ import torch
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
-from .augmentations import StainColorJitter
+import h5py
+import numpy as np
+
+from .augmentations import ReinhardNormalizer, StainColorJitter, RandomStainColorJitter
 from .datasets import BaselineDataset, PrecomputedDataset, precompute
-from .inference import load_test_ids, predict_test, write_submission
+from .inference import load_test_ids, predict_test, predict_test_tta, write_submission
 from .models import build_linear_probing_head, build_lora_dinov2, load_dinov2_backbone
 from .training import fit, fit_trainable_backbone, fit_frozen_backbone
 
@@ -57,10 +60,14 @@ class BaseSolution:
             self.config.update(config)
 
         self.device = torch.device(self.config["device"])
-        self.preprocessing = transforms.Resize(self.config["resize"])
+        self.preprocessing = transforms.Compose([
+            transforms.Resize(self.config["resize"]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
         self.feature_extractor = None
         self.linear_probing = None
         self.history = None
+        self.tta_augmentations = []
 
     def fit(self):
         raise NotImplementedError
@@ -142,7 +149,10 @@ class Baseline224Solution(BaseSolution):
     def __init__(self, config=None):
         super().__init__(config)
         self.config["resize"] = (224, 224)
-        self.preprocessing = transforms.Resize(self.config["resize"])
+        self.preprocessing = transforms.Compose([
+            transforms.Resize(self.config["resize"]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     def _build_dataloaders(self):
         train_dataset = BaselineDataset(self.config["train_path"], self.preprocessing, "train")
@@ -225,9 +235,13 @@ class BaselineColorJitterSolution(BaseSolution):
                     saturation=self.config.get("jitter_saturation", 0.15),
                     hue=self.config.get("jitter_hue", 0.02),
                 ),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
-        self.eval_preprocessing = transforms.Resize(self.config["resize"])
+        self.eval_preprocessing = transforms.Compose([
+            transforms.Resize(self.config["resize"]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     def _build_dataloaders(self):
         train_dataset = BaselineDataset(self.config["train_path"], self.train_preprocessing, "train")
@@ -312,10 +326,21 @@ class Baseline224TargetedAugmentationsSolution(BaseSolution):
     def __init__(self, config=None):
         super().__init__(config)
         self.config["resize"] = (224, 224)
+        resize = transforms.Resize(self.config["resize"])
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        self.train_preprocessing = transforms.Compose([
-            transforms.Resize(self.config["resize"]),
-            StainColorJitter(sigma=self.config.get("stain_sigma", 0.1)),
+        reinhard = None
+        if self.config.get("use_reinhard", False):
+            with h5py.File(self.config["train_path"], "r") as hdf:
+                first_id = list(hdf.keys())[0]
+                reference = torch.tensor(np.array(hdf.get(first_id).get("img"))).float()
+            reinhard = ReinhardNormalizer(reference)
+
+        train_preprocessing = [resize]
+        if reinhard is not None:
+            train_preprocessing.append(reinhard)
+        train_preprocessing += [
+            RandomStainColorJitter(sigma=self.config.get("stain_sigma", 0.1)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomChoice([
@@ -328,8 +353,15 @@ class Baseline224TargetedAugmentationsSolution(BaseSolution):
                 brightness=self.config.get("jitter_brightness", 0.15),
                 contrast=self.config.get("jitter_contrast", 0.15),
             ),
-        ])
-        self.eval_preprocessing = transforms.Resize(self.config["resize"])
+            normalize,
+        ]
+        self.train_preprocessing = transforms.Compose(train_preprocessing)
+
+        eval_preprocessing = [resize]
+        if reinhard is not None:
+            eval_preprocessing.append(reinhard)
+        eval_preprocessing.append(normalize)
+        self.eval_preprocessing = transforms.Compose(eval_preprocessing)
 
     def _build_dataloaders(self):
         train_dataset = BaselineDataset(self.config["train_path"], self.train_preprocessing, "train")
@@ -475,10 +507,21 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
     def __init__(self, config=None):
         super().__init__(config)
         self.config["resize"] = (224, 224)
+        resize = transforms.Resize(self.config["resize"])
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-        self.train_preprocessing = transforms.Compose([
-            transforms.Resize(self.config["resize"]),
-            StainColorJitter(sigma=self.config.get("stain_sigma", 0.1)),
+        reinhard = None
+        if self.config.get("use_reinhard", False):
+            with h5py.File(self.config["train_path"], "r") as hdf:
+                first_id = list(hdf.keys())[0]
+                ref_img = torch.tensor(np.array(hdf.get(first_id).get("img"))).float()
+            reinhard = ReinhardNormalizer(ref_img)
+
+        train_preprocessing = [resize]
+        if reinhard is not None:
+            train_preprocessing.append(reinhard)
+        train_preprocessing += [
+            RandomStainColorJitter(sigma=self.config.get("stain_sigma", 0.1)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomChoice([
@@ -491,8 +534,26 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
                 brightness=self.config.get("jitter_brightness", 0.15),
                 contrast=self.config.get("jitter_contrast", 0.15),
             ),
-        ])
-        self.eval_preprocessing = transforms.Resize(self.config["resize"])
+            normalize,
+        ]
+        self.train_preprocessing = transforms.Compose(train_preprocessing)
+
+        eval_preprocessing = [resize]
+        if reinhard is not None:
+            eval_preprocessing.append(reinhard)
+        eval_preprocessing.append(normalize)
+        self.eval_preprocessing = transforms.Compose(eval_preprocessing)
+
+        tta_base = [resize, reinhard] if reinhard is not None else [resize]
+        self.tta_augmentations = [
+            transforms.Compose(tta_base + [transforms.RandomHorizontalFlip(p=1.0), normalize]),
+            transforms.Compose(tta_base + [transforms.RandomVerticalFlip(p=1.0), normalize]),
+            transforms.Compose(tta_base + [transforms.RandomRotation([90, 90]), normalize]),
+            transforms.Compose(tta_base + [transforms.RandomRotation([180, 180]), normalize]),
+            transforms.Compose(tta_base + [transforms.RandomRotation([270, 270]), normalize]),
+            transforms.Compose(tta_base + [RandomStainColorJitter(sigma=self.config.get("stain_sigma", 0.1), p=1.0), normalize]),
+            transforms.Compose(tta_base + [transforms.ColorJitter(brightness=self.config.get("jitter_brightness", 0.15), contrast=self.config.get("jitter_contrast", 0.15)), normalize]),
+        ]
 
     def _build_dataloaders(self):
         train_dataset = BaselineDataset(self.config["train_path"], self.train_preprocessing, "train")
@@ -517,6 +578,11 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
             {"params": [p for p in self.feature_extractor.parameters() if p.requires_grad], "lr": self.config["backbone_lr"]},
             {"params": self.linear_probing.parameters(), "lr": self.config["head_lr"]},
         ])
+        scheduler = None
+        if self.config.get("scheduler") == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=5, eta_min=1e-5
+            )
         criterion = torch.nn.BCELoss()
         self.history = fit_trainable_backbone(
             train_dataloader,
@@ -529,6 +595,7 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
             num_epochs=self.config["num_epochs"],
             patience=self.config["patience"],
             checkpoint_path=self.config.get("checkpoint_path", "best_model_lora_dinov2_targeted_augmentations.pth"),
+            scheduler=scheduler,
         )
         return self
 
@@ -546,6 +613,28 @@ class LoRATargetedAugmentationsSolution(BaseSolution):
         predictions = predict_test(
             test_ids,
             self.eval_preprocessing,
+            self.feature_extractor,
+            self.linear_probing,
+            self.device,
+            test_images_path=self.config["test_path"],
+        )
+        return write_submission(test_ids, predictions, output_csv)
+
+    def predict_test_tta(self, output_csv="lora_dinov2_targeted_augmentations_tta.csv"):
+        if self.feature_extractor is None or self.linear_probing is None:
+            self._build_model()
+            checkpoint_path = self.config.get("checkpoint_path", "best_model_lora_dinov2_targeted_augmentations.pth")
+            ckpt = torch.load(checkpoint_path, weights_only=True)
+            self.feature_extractor.load_state_dict(ckpt["lora"], strict=False)
+            self.linear_probing.load_state_dict(ckpt["head"])
+            self.feature_extractor.eval()
+            self.linear_probing.eval()
+
+        test_ids = load_test_ids(self.config["test_path"])
+        predictions = predict_test_tta(
+            test_ids,
+            self.eval_preprocessing,
+            self.tta_augmentations,
             self.feature_extractor,
             self.linear_probing,
             self.device,

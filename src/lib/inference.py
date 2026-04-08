@@ -17,7 +17,7 @@ def load_test_ids(test_images_path):
     with h5py.File(test_images_path, "r") as hdf:
         return list(hdf.keys())
 
-
+@torch.no_grad()
 def predict_test(test_ids, preprocessing, feature_extractor, linear_probing, device, test_images_path="test.h5"):
     """Run the notebook's test-time prediction loop."""
 
@@ -27,6 +27,21 @@ def predict_test(test_ids, preprocessing, feature_extractor, linear_probing, dev
             img = preprocessing(torch.tensor(np.array(hdf.get(test_id).get("img")))).unsqueeze(0).float()
             pred = linear_probing(feature_extractor(img.to(device))).detach().cpu()
             predictions.append(int(pred.item() > 0.5))
+    return predictions
+
+
+@torch.no_grad()
+def predict_test_tta(test_ids, eval_preprocessing, tta_augmentations, feature_extractor, linear_probing, device, test_images_path="test.h5"):
+    """Run test-time augmentation by batching clean + all augmented views per image into a single forward pass."""
+
+    predictions = []
+    with h5py.File(test_images_path, "r") as hdf:
+        for test_id in tqdm(test_ids, leave=False):
+            raw_img = torch.tensor(np.array(hdf.get(test_id).get("img")))
+            views = [eval_preprocessing(raw_img).float()] + [aug(raw_img).float() for aug in tta_augmentations]
+            batch = torch.stack(views).to(device)
+            probs = linear_probing(feature_extractor(batch)).cpu()
+            predictions.append(int(probs.mean().item() > 0.5))
     return predictions
 
 

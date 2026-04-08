@@ -1,4 +1,20 @@
 import torch
+import torchstain
+
+
+class ReinhardNormalizer:
+    """Wraps torchstain's ReinhardNormalizer as a preprocessing transform."""
+
+    def __init__(self, reference):
+        self.normalizer = torchstain.normalizers.ReinhardNormalizer(backend='torch')
+        self.normalizer.fit(reference * 255.0)
+
+    def __call__(self, x):
+        norm = self.normalizer.normalize(I=x * 255.0)
+        if norm.shape[-1] == 3:
+            norm = norm.permute(2, 0, 1)
+        return (norm.float() / 255.0).clamp(0.0, 1.0)
+
 
 class StainColorJitter(object):
     """Data augmentation that randomly jitters the stain color of histopathology images."""
@@ -41,3 +57,16 @@ class StainColorJitter(object):
         P = torch.clamp(P, 0.0, 1.0)
 
         return P
+    
+
+class RandomStainColorJitter(object):
+    """Applies StainColorJitter augmentation randomly with a given probability."""
+
+    def __init__(self, sigma=0.05, p=0.75):
+        self.p = p
+        self.jitter = StainColorJitter(sigma=sigma)
+
+    def __call__(self, x):
+        if torch.rand(1).item() < self.p:
+            return self.jitter(x)
+        return x
