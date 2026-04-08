@@ -21,6 +21,19 @@ def build_linear_probing_head(feature_extractor):
     )
 
 
+def build_lora_dinov2(rank=8, alpha=1.0):
+    """Build DINOv2 for LoRA fine-tuning. Loads the DINOv2 backbone and injects LoRA adapters into each attention block's qkv and projection layers."""
+
+    backbone = load_dinov2_backbone()
+    for param in backbone.parameters():
+        param.requires_grad_(False)
+
+    for block in backbone.blocks:
+        block.attn.qkv = LoRALinear(block.attn.qkv, rank=rank, alpha=alpha)
+        block.attn.proj = LoRALinear(block.attn.proj, rank=rank, alpha=alpha)
+        
+    return backbone
+
 class LoRALinear(nn.Module):
     """Wraps a frozen nn.Linear with LoRA."""
 
@@ -42,15 +55,3 @@ class LoRALinear(nn.Module):
     def forward(self, x):
         return self.linear(x) + self.scale * F.linear(F.linear(x, self.lora_A), self.lora_B)
 
-def build_lora_dinov2(rank=8, alpha=1.0):
-    """Load the DINOv2 backbone and inject LoRA adapters into each attention block's qkv and projection layers."""
-
-    backbone = load_dinov2_backbone()
-    for param in backbone.parameters():
-        param.requires_grad_(False)
-
-    for block in backbone.blocks:
-        block.attn.qkv = LoRALinear(block.attn.qkv, rank=rank, alpha=alpha)
-        block.attn.proj = LoRALinear(block.attn.proj, rank=rank, alpha=alpha)
-        
-    return backbone

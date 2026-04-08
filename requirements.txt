@@ -9,6 +9,9 @@ torch>=2.2
 torchvision>=0.17
 torchmetrics>=1.3
 
+# Stain augmentation and normalization
+torchstain>=0.1.0
+
 # Notebook UX
 tqdm>=4.66
 notebook>=7.0

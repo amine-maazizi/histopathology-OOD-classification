@@ -32,7 +32,7 @@ def predict_test(test_ids, preprocessing, feature_extractor, linear_probing, dev
 
 @torch.no_grad()
 def predict_test_tta(test_ids, eval_preprocessing, tta_augmentations, feature_extractor, linear_probing, device, test_images_path="test.h5"):
-    """Run test-time augmentation by batching clean + all augmented views per image into a single forward pass."""
+    """Run inference with test-time augmentation. Averages predictions over the original image and all augmented views."""
 
     predictions = []
     with h5py.File(test_images_path, "r") as hdf:
