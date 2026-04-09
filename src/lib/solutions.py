@@ -15,7 +15,7 @@ from .augmentations import ReinhardNormalizer, StainColorJitter, RandomStainColo
 from .datasets import BaselineDataset, PrecomputedDataset, precompute
 from .inference import load_test_ids, predict_test, predict_test_tta, write_submission
 from .datasets import BaselineDataset, CenterBalancedBatchSampler, PrecomputedDataset, precompute
-from .models import build_linear_probing_head, build_lora_dinov2, load_dinov2_backbone
+from .models import build_linear_probing_head, build_lora_backbone, load_backbone
 from .training import fit_frozen_backbone, fit_trainable_backbone
 
 
@@ -58,6 +58,9 @@ class BaseSolution:
             "head_lr": 0.001,
             "backbone_lr": 4e-4,
             "checkpoint_path": "best_model.pth",
+            "backbone_name": "dinov2_vits14",
+            "backbone_pretrained": True,
+            "backbone_kwargs": {},
             "jitter_brightness": 0.15,
             "jitter_contrast": 0.15,
             "jitter_saturation": 0.15,
@@ -65,6 +68,11 @@ class BaseSolution:
             "stain_sigma": 0.1, 
             "lora_rank": 8,
             "lora_alpha": 1.0,
+            "lora_targets": ("qkv", "proj"),
+            "optimizer_name": "adam",
+            "weight_decay": 0.0,
+            "scheduler": None,
+            "warmup_epochs": 0,
             "coral_lambda": 0.05,
             "coral_eps": 1e-5,
             "num_workers": 4,
@@ -93,6 +101,15 @@ class BaseSolution:
     def predict_test(self, output_csv="baseline.csv"):
         raise NotImplementedError
 
+    def _backbone_name(self):
+        return self.config.get("backbone_name", "dinov2_vits14")
+
+    def _backbone_pretrained(self):
+        return self.config.get("backbone_pretrained", True)
+
+    def _backbone_kwargs(self):
+        return dict(self.config.get("backbone_kwargs", {}))
+
 
 class FrozenBackboneSolution(BaseSolution):
     """
@@ -113,7 +130,11 @@ class FrozenBackboneSolution(BaseSolution):
     def _build_model(self):
         """Load the DINOv2 backbone and build the linear probing head."""
 
-        self.feature_extractor = load_dinov2_backbone().to(self.device)
+        self.feature_extractor = load_backbone(
+            self._backbone_name(),
+            pretrained=self._backbone_pretrained(),
+            **self._backbone_kwargs(),
+        ).to(self.device)
         self.feature_extractor.eval()
         # Freeze the backbone parameters
         for p in self.feature_extractor.parameters():
@@ -394,9 +415,13 @@ class TrainableBackboneSolution(BaseSolution):
         
         """
 
-        self.feature_extractor = build_lora_dinov2(
+        self.feature_extractor = build_lora_backbone(
+            self._backbone_name(),
             rank=self.config["lora_rank"],
             alpha=self.config["lora_alpha"],
+            pretrained=self._backbone_pretrained(),
+            lora_targets=self.config.get("lora_targets", ("qkv", "proj")),
+            **self._backbone_kwargs(),
         ).to(self.device)
         self.linear_probing = build_linear_probing_head(self.feature_extractor).to(self.device)
 
@@ -433,12 +458,22 @@ class TrainableBackboneSolution(BaseSolution):
         return self._make_dataloader(train_dataset, shuffle=True), self._make_dataloader(val_dataset, shuffle=False)
 
     def _build_optimizer(self):
-        """Private helper to build Adam optimizer for both backbone and head with different learning rates."""
+        """Private helper to build the optimizer for both backbone and head."""
 
-        return torch.optim.Adam([
-            {"params": [p for p in self.feature_extractor.parameters() if p.requires_grad], "lr": self.config["backbone_lr"]},
-            {"params": self.linear_probing.parameters(), "lr": self.config["head_lr"]},
-        ])
+        backbone_params = [p for p in self.feature_extractor.parameters() if p.requires_grad]
+        head_params = list(self.linear_probing.parameters())
+        param_groups = [
+            {"params": backbone_params, "lr": self.config["backbone_lr"]},
+            {"params": head_params, "lr": self.config["head_lr"]},
+        ]
+
+        optimizer_name = self.config.get("optimizer_name", "adam").lower()
+        weight_decay = self.config.get("weight_decay", 0.0)
+        if optimizer_name == "adamw":
+            return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        if optimizer_name == "adam":
+            return torch.optim.Adam(param_groups)
+        raise ValueError(f"Unsupported optimizer_name '{optimizer_name}'. Expected 'adam' or 'adamw'.")
 
     def _load_checkpoint(self, path):
         """Private helper to load a checkpoint for the linear probing head and the backbone. Sets both modules to eval mode."""
@@ -519,10 +554,38 @@ class LoRATargetedAugmentationsSolution(TrainableBackboneSolution):
         self._build_model()
         optimizer = self._build_optimizer()
         scheduler = None
-        if self.config.get("scheduler") == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=5, eta_min=1e-5
-            )
+        scheduler_name = self.config.get("scheduler")
+        if scheduler_name is not None:
+            if scheduler_name != "cosine":
+                raise ValueError(f"Unsupported scheduler '{scheduler_name}'. Expected None or 'cosine'.")
+
+            num_epochs = max(int(self.config["num_epochs"]), 1)
+            warmup_epochs = int(self.config.get("warmup_epochs", 0))
+            warmup_epochs = max(0, min(warmup_epochs, num_epochs - 1))
+
+            if warmup_epochs > 0:
+                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=0.1,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(num_epochs - warmup_epochs, 1),
+                    eta_min=1e-5,
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=num_epochs,
+                    eta_min=1e-5,
+                )
         criterion = torch.nn.BCELoss()
         self.history = fit_trainable_backbone(
             train_dataloader,
@@ -620,3 +683,31 @@ class LoRAClassConditionalCoralSolution(TrainableBackboneSolution):
             checkpoint_path=self.config.get("checkpoint_path", "best_model_lora_dinov2_class_conditional_coral.pth"),
         )
         return self
+
+
+@register_solution("lora_uni_targeted_augmentations")
+class LoRAUNITargetedAugmentationsSolution(LoRATargetedAugmentationsSolution):
+    """UNI fine-tuning with targeted augmentations and stage-1 head warm-starting."""
+
+    def __init__(self, config=None):
+        config = dict(config or {})
+        config.setdefault("backbone_name", "uni")
+        config.setdefault("backbone_pretrained", True)
+        config.setdefault(
+            "backbone_kwargs",
+            {
+                "model_name": "hf-hub:MahmoodLab/UNI",
+                "init_values": 1e-5,
+                "dynamic_img_size": True,
+            },
+        )
+        config.setdefault("use_reinhard", True)
+        config.setdefault("lora_targets", ("qkv", "proj"))
+        config.setdefault("optimizer_name", "adamw")
+        config.setdefault("weight_decay", 1e-4)
+        config.setdefault("scheduler", "cosine")
+        config.setdefault("warmup_epochs", 5)
+        config.setdefault("head_init_checkpoint", "best_model_224_targeted_augmentations.pth")
+        config.setdefault("checkpoint_path", "best_model_lora_uni_targeted_augmentations.pth")
+        config.setdefault("output_csv", "uni_targeted_augmentations.csv")
+        super().__init__(config)
