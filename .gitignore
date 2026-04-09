@@ -21,6 +21,8 @@ venv/
 env/
 ENV/
 
+.bashrc
+
 # Tool caches
 .mypy_cache/
 .pytest_cache/
