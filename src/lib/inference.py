@@ -8,7 +8,7 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 
 
 def load_test_ids(test_images_path):

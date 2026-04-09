@@ -7,7 +7,7 @@ from itertools import combinations
 import time
 
 import torch
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 
 
 def binary_accuracy(pred, target):
@@ -503,7 +503,7 @@ def fit_trainable_backbone(
 ):
     """Fine-tune LoRA adapters and train linear probe."""
 
-    best_val_loss, best_epoch = float("inf"), 0
+    best_val_metric, best_epoch = -float("inf"), 0
     best_lora_state = _clone_named_parameters_cpu((name, parameter) for name, parameter in feature_extractor.named_parameters() if "lora_" in name)
     best_head_state = _clone_state_dict_cpu(linear_probing.state_dict())
     history = []
@@ -544,9 +544,9 @@ def fit_trainable_backbone(
             }
         )
 
-        if val_stats["loss"] < best_val_loss:
-            print(f"New best loss {best_val_loss:.4f} -> {val_stats['loss']:.4f}")
-            best_val_loss = val_stats["loss"]
+        if val_stats["metric"] > best_val_metric:
+            print(f"New best accuracy {best_val_metric:.4f} -> {val_stats['metric']:.4f}")
+            best_val_metric = val_stats["metric"]
             best_epoch = epoch
             best_lora_state = _clone_named_parameters_cpu((name, parameter) for name, parameter in feature_extractor.named_parameters() if "lora_" in name)
             best_head_state = _clone_state_dict_cpu(linear_probing.state_dict())
@@ -682,12 +682,13 @@ def fit_trainable_backbone_with_class_conditional_coral(
     num_epochs=100,
     patience=10,
     checkpoint_path="best_model.pth",
+    scheduler=None,
     use_amp=False,
     log_batch_timing=False,
 ):
     """Fine-tune LoRA adapters with class-conditional CORAL and BCE validation early stopping."""
 
-    best_val_loss, best_epoch = float("inf"), 0
+    best_val_metric, best_epoch = -float("inf"), 0
     best_lora_state = _clone_named_parameters_cpu((name, parameter) for name, parameter in feature_extractor.named_parameters() if "lora_" in name)
     best_head_state = _clone_state_dict_cpu(linear_probing.state_dict())
     history = []
@@ -716,6 +717,10 @@ def fit_trainable_backbone_with_class_conditional_coral(
             f"Epoch valid [{epoch + 1}/{num_epochs}] | Loss {val_stats['loss']:.4f} | Metric {val_stats['metric']:.4f}"
         )
 
+        if scheduler is not None:
+            scheduler.step()
+            print(f"LR: {scheduler.get_last_lr()}")
+
         history.append(
             {
                 "epoch": epoch + 1,
@@ -728,9 +733,9 @@ def fit_trainable_backbone_with_class_conditional_coral(
             }
         )
 
-        if val_stats["loss"] < best_val_loss:
-            print(f"New best loss {best_val_loss:.4f} -> {val_stats['loss']:.4f}")
-            best_val_loss = val_stats["loss"]
+        if val_stats["metric"] > best_val_metric:
+            print(f"New best accuracy {best_val_metric:.4f} -> {val_stats['metric']:.4f}")
+            best_val_metric = val_stats["metric"]
             best_epoch = epoch
             best_lora_state = _clone_named_parameters_cpu((name, parameter) for name, parameter in feature_extractor.named_parameters() if "lora_" in name)
             best_head_state = _clone_state_dict_cpu(linear_probing.state_dict())

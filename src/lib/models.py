@@ -161,70 +161,30 @@ def load_uni_backbone(pretrained=True, **kwargs):
             **kwargs,
         )
         _load_checkpoint_into_model(backbone, checkpoint_path, strict=True)
+        setattr(backbone, "_resolved_backbone_name", architecture_name)
+        setattr(backbone, "_requested_backbone_name", model_name)
         return backbone
 
-    # Case 2: Hugging Face / timm model loading
-    candidate_names = []
-    if model_name:
-        candidate_names.append(model_name)
-
-    # Add fallbacks only if user did not already specify one of them
-    for candidate in (
-        "hf-hub:MahmoodLab/UNI",
-        "hf-hub:MahmoodLab/uni",
-        "vit_large_patch16_224",
-    ):
-        if candidate not in candidate_names:
-            candidate_names.append(candidate)
-
-    load_errors = []
-    backbone = None
-
-    for candidate_name in candidate_names:
-        try:
-            if candidate_name.startswith("hf-hub:"):
-                backbone = timm.create_model(
-                    candidate_name,
-                    pretrained=pretrained,
-                    init_values=init_values,
-                    dynamic_img_size=dynamic_img_size,
-                    **kwargs,
-                )
-            elif candidate_name == "vit_large_patch16_224":
-                # Plain timm ViT-L/16 architecture. This is only useful if
-                # pretrained=False or if the caller later loads a local checkpoint.
-                backbone = timm.create_model(
-                    candidate_name,
-                    pretrained=pretrained,
-                    img_size=img_size,
-                    patch_size=patch_size,
-                    init_values=init_values,
-                    num_classes=0,
-                    dynamic_img_size=dynamic_img_size,
-                    **kwargs,
-                )
-            else:
-                backbone = timm.create_model(
-                    candidate_name,
-                    pretrained=pretrained,
-                    init_values=init_values,
-                    dynamic_img_size=dynamic_img_size,
-                    **kwargs,
-                )
-            break
-        except Exception as error:  # pragma: no cover
-            load_errors.append(f"{candidate_name}: {error}")
-
-    if backbone is None:
-        raise RuntimeError(
-            "Could not load a UNI backbone. Tried: "
-            + "; ".join(load_errors)
-            + ". Use a Hugging Face-authorized account for "
-            "'hf-hub:MahmoodLab/UNI', or pass "
-            "config['backbone_kwargs']['checkpoint_path'] to a local "
-            "UNI checkpoint, with init_values=1e-5."
+    # Case 2: genuine UNI loading from the requested identifier only.
+    try:
+        backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            init_values=init_values,
+            dynamic_img_size=dynamic_img_size,
+            num_classes=0,
+            **kwargs,
         )
+    except Exception as error:
+        raise RuntimeError(
+            "Failed to load the requested UNI backbone. "
+            f"Requested model_name='{model_name}'. "
+            "If you need offline loading, pass an explicit local checkpoint_path. "
+            "UNI does not fall back to a generic ViT when model_name='uni'."
+        ) from error
 
+    setattr(backbone, "_resolved_backbone_name", model_name)
+    setattr(backbone, "_requested_backbone_name", model_name)
     return backbone
 
 
@@ -242,23 +202,37 @@ def load_backbone(backbone_name, pretrained=True, **kwargs):
     return backbone_loader(pretrained=pretrained, **kwargs)
 
 
-def build_linear_probing_head(feature_extractor, hidden_dim=None, dropout=0.0, use_sigmoid=True):
-    """Build the linear or shallow-MLP probing head used in the notebook."""
+def build_linear_probing_head(feature_extractor, hidden_dim=None, dropout=0.0, use_sigmoid=True, head_type="linear"):
+    """Build the probing head used in the notebook."""
 
     input_dim = get_backbone_num_features(feature_extractor)
     layers = []
 
-    if hidden_dim is None:
-        layers.append(nn.Linear(input_dim, 1))
-    else:
+    if head_type == "linear":
+        if hidden_dim is None:
+            layers.append(nn.Linear(input_dim, 1))
+        else:
+            layers.extend(
+                [
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(p=dropout),
+                    nn.Linear(hidden_dim, 1),
+                ]
+            )
+    elif head_type == "mlp":
+        hidden_dim = hidden_dim or input_dim
         layers.extend(
             [
+                nn.LayerNorm(input_dim),
                 nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(inplace=True),
+                nn.GELU(),
                 nn.Dropout(p=dropout),
                 nn.Linear(hidden_dim, 1),
             ]
         )
+    else:
+        raise ValueError(f"Unsupported head_type '{head_type}'. Expected 'linear' or 'mlp'.")
 
     if use_sigmoid:
         layers.append(nn.Sigmoid())
@@ -266,8 +240,18 @@ def build_linear_probing_head(feature_extractor, hidden_dim=None, dropout=0.0, u
     return nn.Sequential(*layers)
 
 
-def inject_lora_into_vit_attention(backbone, rank=8, alpha=1.0):
+def inject_lora_into_vit_attention(backbone, rank=8, alpha=1.0, lora_targets=("qkv", "proj")):
     """Replace attention qkv/proj layers with LoRA-wrapped linear layers."""
+
+    allowed_targets = {"qkv", "proj"}
+    lora_targets = tuple(lora_targets)
+    if not lora_targets:
+        raise ValueError("lora_targets must contain at least one attention sublayer name.")
+    invalid_targets = sorted(set(lora_targets) - allowed_targets)
+    if invalid_targets:
+        raise ValueError(
+            f"Unsupported lora_targets {invalid_targets}. Supported targets: {sorted(allowed_targets)}."
+        )
 
     for block_index, block in enumerate(get_backbone_blocks(backbone)):
         attention = getattr(block, "attn", None)
@@ -278,7 +262,7 @@ def inject_lora_into_vit_attention(backbone, rank=8, alpha=1.0):
                 "block with qkv and proj layers."
             )
 
-        for attribute_name in ("qkv", "proj"):
+        for attribute_name in lora_targets:
             linear = getattr(attention, attribute_name, None)
             if linear is None:
                 raise RuntimeError(
@@ -293,14 +277,16 @@ def inject_lora_into_vit_attention(backbone, rank=8, alpha=1.0):
     return backbone
 
 
-def build_lora_backbone(backbone_name, rank=8, alpha=1.0, pretrained=True, **kwargs):
+def build_lora_backbone(backbone_name, rank=8, alpha=1.0, pretrained=True, lora_targets=("qkv", "proj"), **kwargs):
     """Load a backbone and inject LoRA adapters into its attention layers."""
 
     backbone = load_backbone(backbone_name, pretrained=pretrained, **kwargs)
     for param in backbone.parameters():
         param.requires_grad_(False)
 
-    return inject_lora_into_vit_attention(backbone, rank=rank, alpha=alpha)
+    backbone = inject_lora_into_vit_attention(backbone, rank=rank, alpha=alpha, lora_targets=lora_targets)
+    setattr(backbone, "_lora_targets", tuple(lora_targets))
+    return backbone
 
 
 def build_lora_dinov2(rank=8, alpha=1.0, pretrained=True, **kwargs):

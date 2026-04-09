@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 import torch
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 
 from .losses import class_conditional_coral_loss
 

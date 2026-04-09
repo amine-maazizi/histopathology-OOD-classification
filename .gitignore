@@ -38,6 +38,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+.bashrc
 
 # OS files
 .DS_Store
